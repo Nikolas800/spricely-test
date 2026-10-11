@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Football -> Roblox edit.
 
-Plays the clip as-is (same footage, same audio). When the skull hits it holds for
-`skull_hold` seconds, then the frame freezes, every annotated player poofs into a
-stretched-out Roblox avatar and the ball poofs into a treasure chest.
+Plays the clip as-is (same footage, same audio). `skull_hold` seconds after the
+skull hits, every annotated player poofs into a stretched-out Roblox avatar and the
+ball poofs into a treasure chest.
+
+Two ways to do it:
+  overlay_only: true   the video is left exactly as it is; the avatars/chest are
+                       drawn on top and tracked to the shot (follows the edit's
+                       shake, zoom and brightness flicker/fades)
+  overlay_only: false  freeze the frame, flash + shake, then the Roblox scene
 
   python edit.py contact input/clip.mp4 --from 2 --to 6      # find the skull moment
-  python edit.py grab config.json                            # freeze frame + pixel grid
+  python edit.py grab config.json                            # transform frame + pixel grid
   python edit.py preview config.json                         # one still of the effect
   python edit.py render config.json                          # final mp4
 """
@@ -33,10 +39,13 @@ FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 DEFAULTS = {
     "output": "output/football_roblox_edit.mp4",
+    "upscale": 1,
+    "overlay_only": False,
     "skull_hold": 1.0,
     "freeze_on_skull": True,
     "add_skull": False,
     "skull": {"x": 0.5, "y": 0.42, "size": 0.42, "after": "pop"},
+    "keep_on_top": [],
     "erase": [],
     "stretch": 2.4,
     "height_scale": 1.25,
@@ -53,7 +62,7 @@ DEFAULTS = {
 
 # ---------------------------------------------------------------- video io
 
-def probe(path):
+def probe(path, upscale=1):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries",
          "stream=codec_type,width,height,r_frame_rate:stream_side_data=rotation:stream_tags=rotate:format=duration",
@@ -72,16 +81,20 @@ def probe(path):
     if fps <= 0 or fps > 240:
         fps = Fraction(30)
     return {
-        "w": w, "h": h, "fps": fps, "duration": float(info["format"]["duration"]),
+        "w": w * upscale, "h": h * upscale, "upscale": upscale, "fps": fps,
+        "duration": float(info["format"]["duration"]),
         "audio": any(s["codec_type"] == "audio" for s in info["streams"]),
     }
 
 
 def iter_frames(path, meta, max_frames=None):
-    """Yield RGB uint8 frames at a constant frame rate (meta['fps'])."""
+    """Yield RGB uint8 frames at a constant frame rate (meta['fps']), upscaled if asked."""
     w, h = meta["w"] & ~1, meta["h"] & ~1
-    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vf", f"fps={meta['fps']},crop={w}:{h}:0:0",
-           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    vf = f"fps={meta['fps']}"
+    if meta["upscale"] != 1:
+        vf += f",scale={meta['w']}:{meta['h']}:flags=lanczos"
+    vf += f",crop={w}:{h}:0:0"
+    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     if max_frames:
         cmd[-1:-1] = ["-frames:v", str(max_frames)]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
@@ -97,13 +110,16 @@ def iter_frames(path, meta, max_frames=None):
         p.wait()
 
 
-def frame_at(path, meta, index):
-    last = None
-    for i, f in enumerate(iter_frames(path, meta, max_frames=index + 1)):
-        last = f
-    if last is None:
-        sys.exit(f"could not read frame {index} from {path}")
-    return last.copy()
+def frames_at(path, meta, indices):
+    """Return {index: frame} for the requested frame indices."""
+    want, got = set(indices), {}
+    for i, f in enumerate(iter_frames(path, meta, max_frames=max(want) + 1)):
+        if i in want:
+            got[i] = f.copy()
+    missing = want - set(got)
+    if missing:
+        sys.exit(f"could not read frame(s) {sorted(missing)} from {path}")
+    return got
 
 
 # ---------------------------------------------------------------- config
@@ -123,6 +139,9 @@ def load_config(path):
             out[k] = os.path.join(base, out[k])
     if "skull_time" not in out:
         sys.exit("config needs skull_time (seconds) - use `edit.py contact` to find it")
+    if out["overlay_only"]:
+        # the video stays exactly as it is: no freeze, no added skull, no camera fx
+        out.update(freeze_on_skull=False, add_skull=False, flash=False, shake=False, slow_zoom=0.0)
     return out
 
 
@@ -136,7 +155,12 @@ def timeline(cfg, meta):
     return fps, skull_i, trans_i, freeze_i, end_i
 
 
-# ---------------------------------------------------------------- clean plate
+# ---------------------------------------------------------------- masks / inpainting
+
+def grass(rgb):
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    return (hsv[..., 0] >= 30) & (hsv[..., 0] <= 90) & (hsv[..., 1] >= 45) & (hsv[..., 2] >= 35)
+
 
 def player_mask(frame, box, pad=0.12):
     """Mask of the player inside `box`: non-grass pixels, closed and dilated."""
@@ -144,11 +168,8 @@ def player_mask(frame, box, pad=0.12):
     x, y, w, h = box
     x0, y0 = max(0, int(x - w * pad)), max(0, int(y - h * pad))
     x1, y1 = min(W, int(x + w * (1 + pad))), min(H, int(y + h * (1 + pad * 0.5)))
-    crop = frame[y0:y1, x0:x1]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-    grass = (hsv[..., 0] >= 30) & (hsv[..., 0] <= 90) & (hsv[..., 1] >= 45) & (hsv[..., 2] >= 35)
-    m = (~grass).astype(np.uint8) * 255
-    k = max(3, int(min(w, h) * 0.08)) | 1
+    m = (~grass(frame[y0:y1, x0:x1])).astype(np.uint8) * 255
+    k = max(3, int(min(w, h) * 0.13)) | 1
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     m = cv2.dilate(m, np.ones((k, k), np.uint8))
     full = np.zeros((H, W), np.uint8)
@@ -157,29 +178,76 @@ def player_mask(frame, box, pad=0.12):
     return full
 
 
-def clean_plate(frame, cfg):
+def solid_mask(frame, box):
+    """Filled mask of the non-grass blob in `box` (e.g. an emoji sitting on the pitch)."""
     H, W = frame.shape[:2]
-    masks = [player_mask(frame, p["box"]) for p in cfg["players"]]
-    total = np.zeros((H, W), np.uint8)
-    for m in masks:
-        total |= m
-    if cfg["ball"]:
-        (bx, by), r = cfg["ball"]["center"], cfg["ball"]["radius"]
-        cv2.circle(total, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
-    for x, y, w, h in cfg["erase"]:
-        total[int(y):int(y + h), int(x):int(x + w)] = 255
-    plate = frame.copy()
-    if total.any():
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        # inpaint at half res (smoother on big holes), then upsample into the hole
-        small = cv2.resize(bgr, (W // 2, H // 2), interpolation=cv2.INTER_AREA)
-        sm = cv2.resize(total, (W // 2, H // 2), interpolation=cv2.INTER_NEAREST)
-        fill = cv2.inpaint(small, sm, 6, cv2.INPAINT_TELEA)
-        fill = cv2.GaussianBlur(cv2.resize(fill, (W, H), interpolation=cv2.INTER_CUBIC), (0, 0), 2)
-        fill = cv2.cvtColor(fill, cv2.COLOR_BGR2RGB)
-        a = cv2.GaussianBlur(total.astype(np.float32) / 255, (0, 0), 3)[..., None]
-        plate = (frame * (1 - a) + fill * a).astype(np.uint8)
-    return plate, masks
+    x, y, w, h = [int(v) for v in box]
+    m = (~grass(frame[y:y + h, x:x + w])).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    # fill holes (eyes etc.): flood the outside, whatever isn't outside is inside
+    flood = np.pad(m, 1)
+    cv2.floodFill(flood, None, (0, 0), 128)
+    m = np.where(flood[1:-1, 1:-1] == 128, 0, 255).astype(np.uint8)
+    full = np.zeros((H, W), np.float32)
+    full[y:y + h, x:x + w] = cv2.GaussianBlur(m.astype(np.float32) / 255, (0, 0), 1.0)
+    return full
+
+
+def inpaint(frame, mask, down=2):
+    """Paint out `mask` (uint8) from `frame`. Works at 1/down resolution for smooth fills."""
+    if not mask.any():
+        return frame
+    H, W = mask.shape
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    small = cv2.resize(bgr, (W // down, H // down), interpolation=cv2.INTER_AREA)
+    sm = cv2.resize(mask, (W // down, H // down), interpolation=cv2.INTER_NEAREST)
+    fill = cv2.inpaint(small, sm, 6, cv2.INPAINT_TELEA)
+    fill = cv2.GaussianBlur(cv2.resize(fill, (W, H), interpolation=cv2.INTER_CUBIC), (0, 0), down)
+    fill = cv2.cvtColor(fill, cv2.COLOR_BGR2RGB)
+    a = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), 1.5 * down)[..., None]
+    return (frame * (1 - a) + fill * a).astype(np.uint8)
+
+
+def shift(img, dx, dy):
+    """img sampled at (x + dx, y + dy)."""
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REFLECT)
+
+
+def clone_fill(img, mask, dx, dy, soft=3):
+    """Fill `mask` with the texture found (dx, dy) away, e.g. more goal net."""
+    if not mask.any():
+        return img
+    a = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), soft)[..., None]
+    return (img * (1 - a) + shift(img, dx, dy) * a).astype(np.uint8)
+
+
+def _no_room(x0, x1, img):
+    """True when there's no hole-sized strip of the frame left or right of [x0, x1]."""
+    w = x1 - x0 + 4
+    return x0 < w and img.shape[1] - 1 - x1 < w
+
+
+def best_clone_offset(frame, mask, down=3):
+    """Horizontal/vertical offset whose texture best continues the surroundings of `mask`."""
+    small = cv2.resize(frame, (frame.shape[1] // down, frame.shape[0] // down), interpolation=cv2.INTER_AREA)
+    m = cv2.resize(mask, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    ring = cv2.dilate(m.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool) & ~m
+    xs = np.where(m.any(0))[0]
+    x0, x1 = xs.min(), xs.max()
+    src = small.astype(np.float32)
+    best, best_cost = (0, 0), None
+    for dx in range(-small.shape[1], small.shape[1]):
+        # copy from beside the hole (never from inside it), and from inside the frame if possible
+        if abs(dx) < x1 - x0 + 4 or (x0 + dx < 0 or x1 + dx >= small.shape[1]) and not _no_room(x0, x1, src):
+            continue
+        for dy in range(-4, 5, 2):
+            s = shift(src, dx, dy)
+            cost = np.abs(s[ring] - src[ring]).mean()
+            if best_cost is None or cost < best_cost:
+                best, best_cost = (dx, dy), cost
+    return best[0] * down, best[1] * down
 
 
 def sample_colors(frame, box):
@@ -190,8 +258,7 @@ def sample_colors(frame, box):
         reg = frame[y + int(h * fy0):y + int(h * fy1), x + int(w * 0.3):x + int(w * 0.7)].reshape(-1, 3)
         if len(reg) == 0:
             return (200, 200, 200)
-        hsv = cv2.cvtColor(reg[None], cv2.COLOR_RGB2HSV)[0]
-        keep = ~((hsv[:, 0] >= 30) & (hsv[:, 0] <= 90) & (hsv[:, 1] >= 45))
+        keep = ~grass(reg[None])[0]
         reg = reg[keep] if keep.sum() > 10 else reg
         c = np.median(reg, axis=0)
         # punch up saturation a bit so it reads as a Roblox colour
@@ -201,6 +268,69 @@ def sample_colors(frame, box):
         return tuple(int(v) for v in cv2.cvtColor(np.uint8([[hsv]]), cv2.COLOR_HSV2RGB)[0, 0])
 
     return band(0.18, 0.42), band(0.47, 0.6)
+
+
+# ---------------------------------------------------------------- tracking
+
+class Tracker:
+    """Follows the shot from the reference frame: per-frame affine warp + brightness gain.
+
+    Built for edits that freeze the picture and then shake / zoom / flicker it, so the
+    overlays stay glued to the players and fade with the video.
+    """
+
+    def __init__(self, ref, k):
+        self.k = max(1, int(k))
+        self.ref = self._small(ref)
+        self.orb = cv2.ORB_create(3000)
+        self.kp, self.des = self.orb.detectAndCompute(self.ref, None)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.last = np.float32([[1, 0, 0], [0, 1, 0]])
+
+    def _small(self, rgb):
+        g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        if self.k > 1:
+            g = cv2.resize(g, (g.shape[1] // self.k, g.shape[0] // self.k), interpolation=cv2.INTER_AREA)
+        return g
+
+    def track(self, frame):
+        """Returns (M, a, b): M maps reference coords -> this frame; colour ~ a*ref + b."""
+        g = self._small(frame)
+        h, w = g.shape
+        M = self.last.copy()
+        kp, des = self.orb.detectAndCompute(g, None)
+        if des is not None and self.des is not None and len(kp) >= 30:
+            m = self.bf.match(self.des, des)
+            if len(m) >= 30:
+                src = np.float32([self.kp[x.queryIdx].pt for x in m])
+                dst = np.float32([kp[x.trainIdx].pt for x in m])
+                est, inl = cv2.estimateAffinePartial2D(src, dst, ransacReprojThreshold=2.0)
+                if est is not None and inl.sum() >= 40:
+                    M = est.astype(np.float32)
+        try:  # sub-pixel refine; ECC is insensitive to brightness/contrast changes
+            crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
+            _, M2 = cv2.findTransformECC(self.ref.astype(np.float32), g.astype(np.float32), M.copy(),
+                                         cv2.MOTION_AFFINE, crit, None, 5)
+            if np.abs(M2[:, :2] - M[:, :2]).max() < 0.02 and np.abs(M2[:, 2] - M[:, 2]).max() < 4:
+                M = M2.astype(np.float32)
+        except cv2.error:
+            pass
+        self.last = M
+
+        rw = cv2.warpAffine(self.ref, M, (w, h)).astype(np.float32)
+        valid = cv2.erode(cv2.warpAffine(np.full_like(self.ref, 255), M, (w, h)), np.ones((9, 9), np.uint8)) > 0
+        x, y = rw[valid][::5], g[valid][::5].astype(np.float32)
+        if len(x) > 100 and x.std() > 1:
+            a, b = np.linalg.lstsq(np.stack([x, np.ones_like(x)], 1), y, rcond=None)[0]
+        else:
+            a, b = 1.0, 0.0
+        a = float(np.clip(a, 0.0, 2.0))
+
+        # small-image transform -> full-res transform (pixel-centre aware)
+        A, t = M[:, :2], M[:, 2]
+        c = np.float32([(self.k - 1) / 2] * 2)
+        Mf = np.hstack([A, (self.k * t + c - A @ c)[:, None]]).astype(np.float32)
+        return Mf, a, float(b)
 
 
 # ---------------------------------------------------------------- easing
@@ -219,14 +349,46 @@ def ease_out_elastic(p):
 
 # ---------------------------------------------------------------- scene
 
+def _over(dst, spr, x, y):
+    """Alpha-composite `spr` onto RGBA `dst` with its top-left at (x, y), clipping at the edges."""
+    x, y = int(round(x)), int(round(y))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(dst.width, x + spr.width), min(dst.height, y + spr.height)
+    if x1 <= x0 or y1 <= y0:
+        return
+    dst.alpha_composite(spr.crop((x0 - x, y0 - y, x1 - x, y1 - y)), (x0, y0))
+
+
+def composite(base, ov, a=1.0, b=0.0):
+    """base RGB uint8 + premultiplied RGBA float overlay (colours scaled by a, offset by b)."""
+    alpha = ov[..., 3:] / 255.0
+    rgb = ov[..., :3] * a + b * alpha
+    return np.clip(base * (1 - alpha) + rgb, 0, 255).astype(np.uint8)
+
+
+def premultiply(img):
+    arr = np.asarray(img, np.float32)
+    arr[..., :3] *= arr[..., 3:] / 255.0
+    return arr
+
+
 class Scene:
-    """Everything that happens from the transform moment on."""
+    """Everything that happens from the transform moment on, in reference-frame coords."""
 
     def __init__(self, frame, cfg):
         self.cfg = cfg
         self.frame = frame
         self.H, self.W = frame.shape[:2]
-        self.plate, self.masks = clean_plate(frame, cfg)
+        self.down = max(2, int(cfg["upscale"]))
+        self.masks = [player_mask(frame, p["box"]) for p in cfg["players"]]
+        self.erase = np.zeros((self.H, self.W), np.uint8)
+        for x, y, w, h in cfg["erase"]:
+            self.erase[int(y):int(y + h), int(x):int(x + w)] = 255
+        self.on_top = np.zeros((self.H, self.W), np.float32)
+        for box in cfg["keep_on_top"]:
+            self.on_top = np.maximum(self.on_top, solid_mask(frame, box))
+        self._plate = None
+
         self.actors = []
         order = sorted(range(len(cfg["players"])), key=lambda i: cfg["players"][i]["box"][0])
         for n, i in enumerate(order):
@@ -237,25 +399,31 @@ class Scene:
             stretch = p.get("stretch", cfg["stretch"])
             pose = p.get("pose", rb.POSE_CYCLE[i % len(rb.POSE_CYCLE)])
             stud = h * cfg["height_scale"] * p.get("scale", 1.0) / (5.3 * stretch)
-            spr, anchor = rb.render_avatar(stud, shirt, pants, pose=pose)
+            spr, anchor = rb.render_avatar(stud, shirt, pants, pose=pose, stripes=p.get("stripes"))
+            clone = None
+            if p.get("fill") == "clone":
+                clone = best_clone_offset(frame, self.masks[i], self.down)
+                print(f"  player {i}: clone fill from offset {clone}")
             self.actors.append({
                 "kind": "player", "idx": i, "sprite": spr, "anchor": anchor, "stretch": stretch,
-                "foot": (x + w / 2, y + h), "delay": 0.035 * n, "phase": random.Random(i).random() * 6.28,
-                "stud": stud, "mask": self.masks[i],
+                "foot": tuple(p.get("foot", (x + w / 2, y + h))), "delay": 0.035 * n,
+                "phase": random.Random(i).random() * 6.28, "stud": stud, "mask": self.masks[i], "clone": clone,
             })
         if cfg["ball"]:
             (bx, by), r = cfg["ball"]["center"], cfg["ball"]["radius"]
             cw = cfg["ball"].get("chest_width", max(r * 7, min(self.W, self.H) * 0.13))
             spr, anchor = rb.render_chest(cw)
+            ball = np.zeros((self.H, self.W), np.uint8)
+            cv2.circle(ball, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
             self.actors.append({
-                "kind": "chest", "sprite": spr, "anchor": anchor, "foot": (bx, by + r), "delay": 0.08,
-                "glow": rb.glow_sprite(cw * 0.95), "cw": cw,
+                "kind": "chest", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r), "delay": 0.08,
+                "glow": rb.glow_sprite(cw * 0.95), "cw": cw, "mask": ball,
                 "sparkles": [(random.Random(k).uniform(-0.8, 0.8), random.Random(k + 50).uniform(0.1, 1.4),
                               random.Random(k + 99).uniform(0, 6.28)) for k in range(7)],
             })
         self.actors.sort(key=lambda a: a["foot"][1])
 
-    # -- per-actor pieces
+    # -- pieces
 
     def _poof(self, draw, cx, cy, size, tau, seed):
         if not 0 <= tau < 0.5:
@@ -271,34 +439,40 @@ class Scene:
             a = int(255 * (1 - p) ** 1.4)
             draw.ellipse([x - r, y - r, x + r, y + r], fill=(g, g, g, a))
 
-    def _paste(self, img, spr, anchor, foot, sx, sy):
+    def _put(self, ov, spr, anchor, foot, sx, sy):
         w, h = max(1, int(spr.width * sx)), max(1, int(spr.height * sy))
-        s = spr.resize((w, h), Image.BILINEAR)
-        img.paste(s, (int(foot[0] - anchor[0] * sx), int(foot[1] - anchor[1] * sy)), s)
+        _over(ov, spr.resize((w, h), Image.BILINEAR), foot[0] - anchor[0] * sx, foot[1] - anchor[1] * sy)
 
-    def _shadow(self, draw, foot, width, alpha):
-        x, y = foot
-        draw.ellipse([x - width / 2, y - width * 0.12, x + width / 2, y + width * 0.12], fill=(0, 0, 0, alpha))
+    def layer(self, t):
+        """Overlay at t seconds after the transform.
 
-    def render(self, t):
-        """t = seconds since the transform moment."""
-        base = self.plate.copy()
-        # players whose poof hasn't started yet are still the real footage
+        Returns (rgba overlay image, holes, mask of players still waiting for their poof).
+        holes = (mask to inpaint, [(mask, dx, dy) to clone-fill]) for what's transformed so far.
+        """
+        size = (self.W, self.H)
+        hole, clones = self.erase.copy(), []
+        pending = np.zeros((self.H, self.W), np.uint8)
         for a in self.actors:
-            if a["kind"] == "player" and t < a["delay"]:
-                m = a["mask"][..., None] > 0
-                base = np.where(m, self.frame, base)
-        img = Image.fromarray(base)
-        fx = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        fxd = ImageDraw.Draw(fx)
-        shadows = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            if t < a["delay"]:
+                pending |= a["mask"]
+            elif a.get("clone"):
+                clones.append((a["mask"], *a["clone"]))
+            else:
+                hole |= a["mask"]
+
+        ov = Image.new("RGBA", size, (0, 0, 0, 0))
+        shadows = Image.new("RGBA", size, (0, 0, 0, 0))
         shd = ImageDraw.Draw(shadows)
         for a in self.actors:
             tau = t - a["delay"]
             if a["kind"] == "player" and tau >= 0:
-                self._shadow(shd, a["foot"], a["stud"] * 4.6 * min(1.0, tau / 0.12), 90)
-        img.paste(shadows, (0, 0), shadows)
+                wd = a["stud"] * 4.6 * min(1.0, tau / 0.12)
+                x, y = a["foot"]
+                shd.ellipse([x - wd / 2, y - wd * 0.12, x + wd / 2, y + wd * 0.12], fill=(0, 0, 0, 90))
+        ov.alpha_composite(shadows)
 
+        fx = Image.new("RGBA", size, (0, 0, 0, 0))
+        fxd = ImageDraw.Draw(fx)
         for a in self.actors:
             tau = t - a["delay"]
             if tau < 0:
@@ -306,22 +480,21 @@ class Scene:
             spr = a["sprite"]
             if a["kind"] == "player":
                 S = a["stretch"]
-                if tau < 0.12:
+                if tau < 0.12:  # pop in at normal Roblox proportions
                     k = ease_out_back(tau / 0.12)
                     sx, sy = k, k
                 elif tau < 0.30:
                     sx, sy = 1.0, 1.0
-                elif tau < 0.95:
+                elif tau < 0.95:  # boing up to full stretch
                     e = ease_out_elastic((tau - 0.30) / 0.65)
                     sy = 1 + (S - 1) * e
                     sx = 1 - 0.15 * (sy - 1) / max(S - 1, 1e-6)
-                else:
+                else:  # idle wobble
                     wob = math.sin(2 * math.pi * 1.6 * tau + a["phase"])
                     sy, sx = S * (1 + 0.03 * wob), 0.85 * (1 - 0.02 * wob)
                 if sx > 0.02:
-                    self._paste(img, spr, a["anchor"], a["foot"], sx, sy)
-                cy = a["foot"][1] - a["stud"] * 2.6
-                self._poof(fxd, a["foot"][0], cy, a["stud"] * 3.2, tau, a["idx"])
+                    self._put(ov, spr, a["anchor"], a["foot"], sx, sy)
+                self._poof(fxd, a["foot"][0], a["foot"][1] - a["stud"] * 2.6, a["stud"] * 3.2, tau, a["idx"])
             else:
                 cw = a["cw"]
                 fx_, fy_ = a["foot"]
@@ -329,26 +502,43 @@ class Scene:
                 if glow_a > 0:
                     g = a["glow"].rotate(tau * 25, resample=Image.BILINEAR)
                     pulse = 0.85 + 0.15 * math.sin(tau * 5)
-                    al = g.getchannel("A").point(lambda v: int(v * glow_a * pulse))
-                    g.putalpha(al)
-                    img.paste(g, (int(fx_ - g.width / 2), int(fy_ - cw * 0.45 - g.height / 2)), g)
+                    g.putalpha(g.getchannel("A").point(lambda v: int(v * glow_a * pulse)))
+                    _over(ov, g, fx_ - g.width / 2, fy_ - cw * 0.45 - g.height / 2)
                 k = ease_out_elastic(tau / 0.7) if tau < 0.7 else 1 + 0.02 * math.sin(tau * 4)
                 if k > 0.02:
                     # squash & stretch: wide while it grows, narrow while it overshoots
                     sx = math.sqrt(k) if k < 1 else 1 - 0.6 * (k - 1)
-                    self._paste(img, spr, a["anchor"], (fx_, fy_), sx, k)
+                    self._put(ov, spr, a["anchor"], (fx_, fy_), sx, k)
                 if tau > 0.25:
-                    for i, (ox, oy, ph) in enumerate(a["sparkles"]):
+                    for ox, oy, ph in a["sparkles"]:
                         tw = 0.5 + 0.5 * math.sin(tau * 6 + ph)
                         if tw < 0.25:
                             continue
                         s = rb.sparkle(cw * 0.12 * tw)
-                        img.paste(s, (int(fx_ + ox * cw - s.width / 2), int(fy_ - oy * cw * 0.75 - s.height / 2)), s)
+                        _over(ov, s, fx_ + ox * cw - s.width / 2, fy_ - oy * cw * 0.75 - s.height / 2)
                 self._poof(fxd, fx_, fy_ - cw * 0.3, cw * 0.55, tau, 999)
+        ov.alpha_composite(fx)
+        return ov, (hole, clones), pending
 
-        img.paste(fx, (0, 0), fx)
-        out = np.asarray(img).astype(np.float32)
+    def clean(self, img, holes, M=None):
+        """Remove transformed players/ball from `img` (warping the masks by M if given)."""
+        hole, clones = holes
+        H, W = img.shape[:2]
 
+        def w(m):
+            return m if M is None else cv2.warpAffine(m, M, (W, H), flags=cv2.INTER_NEAREST)
+        for m, dx, dy in clones:
+            img = clone_fill(img, w(m), dx, dy, soft=self.down)
+        return inpaint(img, w(hole), self.down)
+
+    def render_frozen(self, t):
+        """Freeze-frame version: overlay on the cleaned-up still, plus flash / shake / zoom."""
+        if self._plate is None:
+            self._plate = self.clean(self.frame, self.layer(1e9)[1])
+        ov, _, pending = self.layer(t)
+        # players whose poof hasn't started yet are still the real footage
+        base = np.where(pending[..., None] > 0, self.frame, self._plate)
+        out = composite(base, premultiply(ov)).astype(np.float32)
         if self.cfg["flash"] and t < 0.18:
             out = out + (255 - out) * (0.85 * (1 - t / 0.18))
         out = np.clip(out, 0, 255).astype(np.uint8)
@@ -359,6 +549,18 @@ class Scene:
             dx, dy = r.uniform(-amp, amp), r.uniform(-amp, amp)
         z = 1 + self.cfg["slow_zoom"] * min(1.0, t / 4.0)
         return warp(out, z, dx, dy)
+
+    def render_tracked(self, live, t, M, a, b):
+        """Overlay-only version: the live frame stays, overlay follows the shot via M."""
+        ov, holes, _ = self.layer(t)
+        H, W = live.shape[:2]
+        base = self.clean(live, holes, M)
+        ovw = cv2.warpAffine(premultiply(ov), M, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
+        out = composite(base, ovw, a, b)
+        if self.on_top.any():  # keep e.g. the clip's own 💀 in front of the avatars
+            top = cv2.warpAffine(self.on_top, M, (W, H), flags=cv2.INTER_LINEAR)[..., None]
+            out = (out * (1 - top) + live * top).astype(np.uint8)
+        return out
 
 
 def warp(img, zoom, dx, dy):
@@ -431,25 +633,46 @@ def write_sfx(path, cfg, sr=44100):
 
 # ---------------------------------------------------------------- commands
 
-def compose(frame, i, cfg, fps, skull_i, trans_i, freeze, scene, skull):
-    if i >= trans_i:
-        out = scene.render((i - trans_i) / fps)
-    elif i >= skull_i and cfg["freeze_on_skull"]:
-        out = freeze
-    else:
-        out = frame
-    if skull is not None:
-        out = skull.draw(out, (i - skull_i) / fps, (i - trans_i) / fps)
-    return out
+class Composer:
+    """Decides what each output frame is."""
+
+    def __init__(self, cfg, meta):
+        self.cfg = cfg
+        self.fps, self.skull_i, self.trans_i, self.freeze_i, self.end_i = timeline(cfg, meta)
+        self.skull = Skull(cfg, meta["w"] & ~1, meta["h"] & ~1) if cfg["add_skull"] else None
+        self.freeze = self.scene = self.tracker = None
+
+    def reference(self, frame):
+        self.freeze = frame.copy()
+        self.scene = Scene(self.freeze, self.cfg)
+        if self.cfg["overlay_only"]:
+            self.tracker = Tracker(self.freeze, self.cfg["upscale"])
+
+    def frame(self, frame, i):
+        cfg = self.cfg
+        t = (i - self.trans_i) / self.fps
+        if i >= self.trans_i and cfg["overlay_only"]:
+            return self.scene.render_tracked(frame, t, *self.tracker.track(frame))
+        if i >= self.trans_i:
+            out = self.scene.render_frozen(t)
+        elif i >= self.skull_i and cfg["freeze_on_skull"]:
+            out = self.freeze
+        else:
+            out = frame
+        if self.skull is not None:
+            out = self.skull.draw(out, (i - self.skull_i) / self.fps, t)
+        return out
 
 
 def cmd_render(args):
     cfg = load_config(args.config)
-    meta = probe(cfg["input"])
-    fps, skull_i, trans_i, freeze_i, end_i = timeline(cfg, meta)
+    meta = probe(cfg["input"], cfg["upscale"])
+    comp = Composer(cfg, meta)
+    fps, end_i = comp.fps, comp.end_i
     W, H = meta["w"] & ~1, meta["h"] & ~1
     os.makedirs(os.path.dirname(cfg["output"]) or ".", exist_ok=True)
-    print(f"{W}x{H} @ {fps:.3f}fps  skull@{skull_i}  transform@{trans_i}  freeze@{freeze_i}  end@{end_i}")
+    print(f"{W}x{H} @ {fps:.3f}fps  skull@{comp.skull_i}  transform@{comp.trans_i}  "
+          f"reference@{comp.freeze_i}  end@{end_i}  {'overlay-only' if cfg['overlay_only'] else 'freeze'}")
 
     tmpdir = tempfile.mkdtemp()
     cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
@@ -469,29 +692,26 @@ def cmd_render(args):
                 "-map", "[a]"]
     elif audio_inputs:
         cmd += ["-map", audio_inputs[0]]
+    # no sfx: copy the original audio bit-for-bit; with sfx it has to be re-encoded after mixing
+    acodec = ["-c:a", "aac", "-b:a", "192k"] if cfg["sfx"] else ["-c:a", "copy"]
     cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", str(cfg["crf"]), "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-t", f"{end_i / fps:.4f}", "-movflags", "+faststart", cfg["output"]]
+            *acodec, "-t", f"{end_i / fps:.4f}", "-movflags", "+faststart", cfg["output"]]
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    skull = Skull(cfg, W, H) if cfg["add_skull"] else None
-    freeze = scene = None
-    last = None
+    i = 0
     for i, frame in enumerate(iter_frames(cfg["input"], meta)):
         if i >= end_i:
             break
-        if i == freeze_i:
-            freeze = frame.copy()
-            scene = Scene(freeze, cfg)
-        last = compose(frame, i, cfg, fps, skull_i, trans_i, freeze, scene, skull)
-        enc.stdin.write(np.ascontiguousarray(last).tobytes())
+        if i == comp.freeze_i:
+            comp.reference(frame)
+        enc.stdin.write(np.ascontiguousarray(comp.frame(frame, i)).tobytes())
         if i % 30 == 0:
             print(f"  frame {i}/{end_i}", end="\r", flush=True)
     else:
         i += 1
     # clip ran out before end_time: keep the frozen scene going
-    while i < end_i and scene is not None:
-        last = compose(None, i, cfg, fps, skull_i, trans_i, freeze, scene, skull)
-        enc.stdin.write(np.ascontiguousarray(last).tobytes())
+    while i < end_i and comp.scene is not None and not cfg["overlay_only"]:
+        enc.stdin.write(np.ascontiguousarray(comp.frame(None, i)).tobytes())
         i += 1
     enc.stdin.close()
     if enc.wait() != 0:
@@ -501,13 +721,12 @@ def cmd_render(args):
 
 def cmd_preview(args):
     cfg = load_config(args.config)
-    meta = probe(cfg["input"])
-    fps, skull_i, trans_i, freeze_i, _ = timeline(cfg, meta)
-    freeze = frame_at(cfg["input"], meta, freeze_i)
-    scene = Scene(freeze, cfg)
-    skull = Skull(cfg, freeze.shape[1], freeze.shape[0]) if cfg["add_skull"] else None
-    i = trans_i + int(round(args.t * fps))
-    out = compose(freeze, i, cfg, fps, skull_i, trans_i, freeze, scene, skull)
+    meta = probe(cfg["input"], cfg["upscale"])
+    comp = Composer(cfg, meta)
+    i = comp.trans_i + int(round(args.t * comp.fps))
+    got = frames_at(cfg["input"], meta, [comp.freeze_i, i])
+    comp.reference(got[comp.freeze_i])
+    out = comp.frame(got[i], i)
     path = args.out or os.path.splitext(cfg["output"])[0] + f"_preview_{args.t:.2f}s.png"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     Image.fromarray(out).save(path)
@@ -532,7 +751,7 @@ def grid(img, step=50):
 def cmd_grab(args):
     if args.target.endswith(".json"):
         cfg = load_config(args.target)
-        meta = probe(cfg["input"])
+        meta = probe(cfg["input"], cfg["upscale"])
         fps, _, _, freeze_i, _ = timeline(cfg, meta)
         src, idx = cfg["input"], freeze_i
         if args.time is not None:
@@ -541,7 +760,7 @@ def cmd_grab(args):
         src = args.target
         meta = probe(src)
         idx = int(round((args.time or 0) * float(meta["fps"])))
-    f = frame_at(src, meta, idx)
+    f = frames_at(src, meta, [idx])[idx]
     im = grid(f, args.step) if not args.plain else Image.fromarray(f)
     path = args.out or f"frame_{idx}.png"
     im.save(path)
@@ -593,7 +812,7 @@ def main():
     p.set_defaults(fn=cmd_preview)
 
     p = sub.add_parser("grab", help="save a frame with a pixel grid (for placing players/ball)")
-    p.add_argument("target", help="config.json (grabs the freeze frame) or a video file")
+    p.add_argument("target", help="config.json (grabs the reference frame) or a video file")
     p.add_argument("--time", type=float)
     p.add_argument("--step", type=int, default=50)
     p.add_argument("--plain", action="store_true")

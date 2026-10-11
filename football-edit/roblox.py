@@ -94,11 +94,12 @@ def _rounded_rect_poly(cx, cy, w, h, r, steps=6):
     return pts
 
 
-def render_avatar(stud_px, shirt, pants, skin=ROBLOX_YELLOW, pose="tpose", face=True):
+def render_avatar(stud_px, shirt, pants, skin=ROBLOX_YELLOW, pose="tpose", face=True, stripes=None):
     """Render a classic R6 avatar at `stud_px` pixels per stud.
 
     Returns (RGBA image, foot_anchor_xy) where the anchor is the point between the
     feet in image pixels. The sprite is unstretched; callers squash/stretch it.
+    `stripes` is an optional second shirt colour drawn as vertical stripes on the torso.
     """
     shirt, pants, skin = hex_to_rgb(shirt), hex_to_rgb(pants), hex_to_rgb(skin)
     la, ra, ll, rl = POSES.get(pose, POSES["idle"])
@@ -139,6 +140,9 @@ def render_avatar(stud_px, shirt, pants, skin=ROBLOX_YELLOW, pose="tpose", face=
 
     # Torso
     draw_extruded(dr, [P(-1, 4), P(1, 4), P(1, 2), P(-1, 2)], shirt, depth)
+    if stripes is not None:
+        for x0 in (-0.6, 0.2):
+            dr.polygon([P(x0, 4), P(x0 + 0.4, 4), P(x0 + 0.4, 2), P(x0, 2)], fill=hex_to_rgb(stripes))
     # little collar + number-ish stripe so it reads as a jersey
     cx, cy = P(0, 3.95)
     dr.polygon([(cx - 0.32 * u, cy), (cx + 0.32 * u, cy), (cx, cy + 0.32 * u)], fill=shade(shirt, 0.6))
