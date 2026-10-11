@@ -1,0 +1,20 @@
+{
+  "input": "input/clip.mp4",
+  "output": "output/football_roblox_edit.mp4",
+
+  "skull_time": 4.20,
+  "skull_hold": 1.0,
+  "freeze_on_skull": true,
+  "add_skull": false,
+  "erase": [],
+
+  "stretch": 2.4,
+  "players": [
+    {"box": [120, 700, 110, 300]},
+    {"box": [520, 650, 95, 260], "pose": "dab"},
+    {"box": [760, 820, 130, 360], "shirt": "#d71920", "pants": "#ffffff"}
+  ],
+  "ball": {"center": [610, 1010], "radius": 18},
+
+  "sfx": false
+}
