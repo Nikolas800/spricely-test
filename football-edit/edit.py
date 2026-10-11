@@ -34,7 +34,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import avatar3d
-import rig
+import puppet
 import roblox as rb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -496,12 +496,13 @@ class Scene:
             p = cfg["players"][i]
             x, y, w, h = p["box"]
             if p.get("rig"):
-                # a character built on the player's own joints, trimmed to their outline
+                # one Roblox character image, puppet-warped onto the player's skeleton and outline
                 sil = silhouette(frame, p["box"])
                 outfit = p.get("outfit", "swat")
                 outfit = outfit if outfit == "swat" else cfg["kits"][outfit]
-                print(f"  fitting player {i} ({p.get('outfit', 'swat')}) ...")
-                spr, (ox, oy) = rig.render_fitted(p["rig"], outfit, sil, os.path.join(HERE, ".cache", "rigs"))
+                print(f"  warping onto player {i} ({p.get('outfit', 'swat')}) ...")
+                tpl = puppet.load_template(outfit, back=not p["rig"].get("face", True))
+                spr, (ox, oy) = puppet.warp(tpl, p["rig"], sil, order=puppet.paint_order(p["rig"]))
                 if p.get("clip", True):
                     spr = clip_sprite(spr, (ox, oy), sil)
                 foot = (ox + spr.width / 2, oy + spr.height)

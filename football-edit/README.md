@@ -39,9 +39,15 @@ python edit.py render config.json                        # -> output/football_ro
 
 ## The Roblox characters
 
-### Fitted to the player (`rig`)
+### Fitted to the player (`rig`): one image, puppet-warped
 
-Give a player a `rig` with their joints, measured on the reference frame. Pairs are `[screen-left, screen-right]`:
+Every fitted player starts from the **same single picture** of a Roblox character: `assets/templates/swat.png`
+(and `swat_back.png` for players seen from behind), or a kit version such as Messi's Barça one. That one image is
+bent onto the player like a puppet warp. A fine triangle mesh over the picture follows the player's skeleton, each
+limb is stretched across to the player's limb thickness as measured in the footage, and the result is trimmed to
+the player's silhouette (`"clip": false` turns that off).
+
+Give the player a `rig` with their joints, measured on the reference frame. Pairs are `[screen-left, screen-right]`:
 
 ```json
 "rig": {"head": [x, y], "r": 15, "neck": [x, y],
@@ -50,11 +56,9 @@ Give a player a `rig` with their joints, measured on the reference frame. Pairs 
         "face": true, "front": ["r_arm"], "back": []}
 ```
 
-`rig.py` lays a rounded plastic part along each bone. Each part is as wide as that limb measures in the footage
-(non-grass pixels), and the whole render is then trimmed to the player's silhouette (`"clip": false` turns that
-off). `outfit` is `"swat"` (helmet, vest with SWAT lettering, belt and pouches, kneepads, gloves, boots) or the
-name of one of your `kits`. Use `face: false` for players seen from behind, and `front` / `back` for limbs that
-cross in front of or behind the body. Renders are cached in `.cache/`.
+`outfit` is `"swat"` or the name of one of your `kits`. `face: false` uses the back view of the template.
+`front` / `back` move a limb (`l_arm`, `r_arm`, `l_leg`, `r_leg`) in front of or behind the body.
+`python puppet.py` re-renders the SWAT template images.
 
 ### Stickers
 
@@ -111,6 +115,7 @@ All coordinates are pixels in the (upscaled) frame that `grab` gives you.
 - In overlay mode, every later frame is matched to the reference (ORB features + ECC refinement), which gives an
   affine warp plus a brightness gain. The cleanup masks and the sticker layer are warped by it, so everything
   stays glued to the shot.
-- `rig.py` builds fitted characters from joints and renders them with the same raymarcher.
+- `puppet.py` renders the template character once (image, part map and joint positions), then warps that one
+  image onto each player with linear blend skinning over a triangle mesh.
 - `avatar3d.py` is a small numpy SDF raymarcher: rounded R6 parts, soft shadows, ambient occlusion, rim light, the
   classic smile and striped kits. `roblox.py` draws the chest, glow and sparkles.

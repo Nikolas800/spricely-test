@@ -23,6 +23,7 @@ POSES = {
     "star": {"larm": (0, -55), "rarm": (0, 55), "lleg": (0, -18), "rleg": (0, 18)},
     "tpose": {"larm": (0, -90), "rarm": (0, 90)},
     "cheer": {"larm": (0, -160), "rarm": (0, 160), "lleg": (0, -8), "rleg": (0, 8)},
+    "apose": {"larm": (0, -26), "rarm": (0, 26), "lleg": (0, -7), "rleg": (0, 7)},
 }
 
 
