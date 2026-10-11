@@ -3,11 +3,11 @@
 
 Plays the clip as-is (same footage, same audio). At the transform moment (the Nth
 boom after the skull, or `skull_hold` seconds after it) every annotated player gets
-a Roblox avatar PNG pasted over them, stretched to their shape, and the ball turns
-into a treasure chest.
+a Roblox character over them, warped to their shape, and the ball turns into a
+holographic vault.
 
 Two ways to do it:
-  overlay_only: true   the video is left exactly as it is; the avatars/chest are
+  overlay_only: true   the video is left exactly as it is; the characters/vault are
                        drawn on top and tracked to the shot (follows the edit's
                        shake, zoom and brightness flicker/fades)
   overlay_only: false  freeze the frame, flash + shake, then the Roblox scene
@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import avatar3d
 import puppet
-import roblox as rb
+import vault
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -525,14 +525,14 @@ class Scene:
             })
         if cfg["ball"]:
             (bx, by), r = cfg["ball"]["center"], cfg["ball"]["radius"]
-            cw = cfg["ball"].get("chest_width", max(r * 7, min(self.W, self.H) * 0.13))
-            spr, anchor = rb.render_chest(cw)
+            cw = cfg["ball"].get("width", max(r * 7.5, min(self.W, self.H) * 0.15))
+            spr, anchor = vault.sprite(cw)
             ball = np.zeros((self.H, self.W), np.uint8)
             cv2.circle(ball, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
             self.actors.append({
-                "kind": "chest", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r),
+                "kind": "vault", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r),
                 "delay": 0.08 if poof else 0.0,
-                "glow": rb.glow_sprite(cw * 0.95), "cw": cw, "mask": ball,
+                "glow": vault.Glow(spr), "cw": cw, "mask": ball,
                 "sparkles": [(random.Random(k).uniform(-0.8, 0.8), random.Random(k + 50).uniform(0.1, 1.4),
                               random.Random(k + 99).uniform(0, 6.28)) for k in range(7)],
             })
@@ -608,22 +608,20 @@ class Scene:
                 cw = a["cw"]
                 fx_, fy_ = a["foot"]
                 glow_a = min(1.0, max(0.0, (tau - 0.1) / 0.4)) if poof else 1.0
-                if glow_a > 0:
-                    g = a["glow"].rotate(tau * 25, resample=Image.BILINEAR)
-                    pulse = 0.85 + 0.15 * math.sin(tau * 5)
-                    g.putalpha(g.getchannel("A").point(lambda v: int(v * glow_a * pulse)))
-                    _over(ov, g, fx_ - g.width / 2, fy_ - cw * 0.45 - g.height / 2)
+                if glow_a > 0:  # rainbow neon glow around the vault
+                    g = a["glow"]
+                    _over(ov, g.frame(tau, glow_a), fx_ - a["anchor"][0] - g.pad, fy_ - a["anchor"][1] - g.pad)
                 k = ease_out_elastic(tau / 0.7) if poof and tau < 0.7 else 1 + 0.02 * math.sin(tau * 4)
                 if k > 0.02:
                     # squash & stretch: wide while it grows, narrow while it overshoots
                     sx = math.sqrt(k) if k < 1 else 1 - 0.6 * (k - 1)
-                    self._put(ov, spr, a["anchor"], (fx_, fy_), sx, k)
+                    self._put(ov, vault.sheen(spr, tau), a["anchor"], (fx_, fy_), sx, k)
                 if tau > 0.25 or not poof:
                     for ox, oy, ph in a["sparkles"]:
                         tw = 0.5 + 0.5 * math.sin(tau * 6 + ph)
                         if tw < 0.25:
                             continue
-                        s = rb.sparkle(cw * 0.12 * tw)
+                        s = vault.sparkle(cw * 0.12 * tw)
                         _over(ov, s, fx_ + ox * cw - s.width / 2, fy_ - oy * cw * 0.75 - s.height / 2)
                 if poof:
                     self._poof(fxd, fx_, fy_ - cw * 0.3, cw * 0.55, tau, 999)

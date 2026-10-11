@@ -1,14 +1,14 @@
 # Football → Roblox edit
 
 Takes a football clip and keeps it exactly as is, with the same footage and the same sound. On a boom after the 💀,
-every player is instantly **overlaid with a Roblox character built on their own skeleton**: posed like them, as
-wide as their limbs, and trimmed to their outline. The real players stay underneath. The **ball becomes a glowing
-treasure chest**.
+every player is instantly **overlaid with a Roblox character warped onto their own skeleton**: posed like them,
+as wide as their limbs, and trimmed to their outline. The real players stay underneath. The **ball becomes a
+holographic "secret prototype vault"** with a colour-cycling neon glow.
 
 `config.json` is the finished setup for `input/videoplayback123.mp4` (the Messi edit). Its output is
 `output/messi_roblox_edit.mp4`. The skull lands at 14.73s, and the booms after it are at 15.33, 15.71 and 16.17s.
 On boom 2 (15.71s), every player turns into a SWAT Roblox character, except Messi, who stays in his Barça kit
-next to the chest.
+next to the vault.
 
 There are two modes:
 
@@ -90,12 +90,12 @@ python avatar3d.py out.png --shirt "#1b3f94" --stripes "#a50044" --pants "#1b3f9
 | `skull_hold` | `1.0` | used when neither of the above is set: transform this long after the skull |
 | `ref_time` | transform time | the frame your boxes are measured on (`grab` shows it) |
 | `appear` | `"instant"` | `"instant"` = pasted on in one frame; `"poof"` = smoke puff + elastic pop, one player at a time |
-| `remove_players` | `true` | `false` = overlay only: the real players and ball stay underneath the characters and chest |
+| `remove_players` | `true` | `false` = overlay only: the real players and ball stay underneath the characters and vault |
 | `keep_on_top` | `[]` | `[x,y,w,h]` boxes around things in the clip (like its 💀) that should stay in front of the stickers |
 | `kits` | `{}` | named colour sets: `{"barca": {"shirt": "#...", "stripes": "#...", "pants": "#...", "socks": "#..."}}` |
 | `fit` | `[1.1, 1.08]` | sticker size relative to the player's box (width, height) |
 | `players[]` | `[]` | `box` is required. Fitted: `rig`, `outfit`, `clip`. Sticker: `kit`, `pose` (`idle` `run` `star` `tpose` `cheer`), `flip`, `png`, `fit`, `foot` (`[x,y]` override), the colour keys above, and `fill: "clone"` (fill the hole with texture cloned from beside the player instead of smoothing it, good for players in front of a goal net) |
-| `ball` | `null` | `{"center":[x,y], "radius":r}`, plus an optional `chest_width` in px |
+| `ball` | `null` | `{"center":[x,y], "radius":r}`, plus an optional vault `width` in px |
 | `erase` | `[]` | extra `[x,y,w,h]` boxes to paint out at the transform |
 | `end_time` | clip length | stop here; in freeze mode, a time past the end of the clip keeps the Roblox scene going |
 | `freeze_on_skull` | `true` | freeze mode: freeze as soon as the skull hits (`false` = keep playing until the transform) |
@@ -118,4 +118,7 @@ All coordinates are pixels in the (upscaled) frame that `grab` gives you.
 - `puppet.py` renders the template character once (image, part map and joint positions), then warps that one
   image onto each player with linear blend skinning over a triangle mesh.
 - `avatar3d.py` is a small numpy SDF raymarcher: rounded R6 parts, soft shadows, ambient occlusion, rim light, the
-  classic smile and striped kits. `roblox.py` draws the chest, glow and sparkles.
+  classic smile and striped kits.
+- `vault.py` models the vault (rainbow-framed holographic cube, magenta screen, rainbow keypad, dial, LEDs, magenta
+  handle, glowing green pad), renders it once to `assets/vault.png`, and animates its neon glow, sheen and
+  sparkles. `python vault.py` re-renders it.
