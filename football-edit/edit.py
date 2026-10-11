@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Football -> Roblox edit.
 
-Plays the clip as-is (same footage, same audio). `skull_hold` seconds after the
-skull hits, every annotated player poofs into a stretched-out Roblox avatar and the
-ball poofs into a treasure chest.
+Plays the clip as-is (same footage, same audio). At the transform moment (the Nth
+boom after the skull, or `skull_hold` seconds after it) every annotated player gets
+a Roblox avatar PNG pasted over them, stretched to their shape, and the ball turns
+into a treasure chest.
 
 Two ways to do it:
   overlay_only: true   the video is left exactly as it is; the avatars/chest are
@@ -32,6 +33,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+import avatar3d
 import roblox as rb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,13 +44,17 @@ DEFAULTS = {
     "upscale": 1,
     "overlay_only": False,
     "skull_hold": 1.0,
+    "on_boom": None,
+    "transform_time": None,
+    "ref_time": None,
+    "appear": "instant",
     "freeze_on_skull": True,
     "add_skull": False,
     "skull": {"x": 0.5, "y": 0.42, "size": 0.42, "after": "pop"},
     "keep_on_top": [],
     "erase": [],
-    "stretch": 2.4,
-    "height_scale": 1.25,
+    "kits": {},
+    "fit": [1.1, 1.08],
     "players": [],
     "ball": None,
     "end_time": None,
@@ -139,6 +145,16 @@ def load_config(path):
             out[k] = os.path.join(base, out[k])
     if "skull_time" not in out:
         sys.exit("config needs skull_time (seconds) - use `edit.py contact` to find it")
+    out["_base"] = base
+    if out["transform_time"] is None:
+        if out["on_boom"]:
+            booms = find_booms(out["input"], out["skull_time"])
+            print("booms after the skull: " + ", ".join(f"#{k + 1} {b:.2f}s" for k, b in enumerate(booms)))
+            if len(booms) < out["on_boom"]:
+                sys.exit(f"only found {len(booms)} booms after the skull, can't use boom #{out['on_boom']}")
+            out["transform_time"] = booms[out["on_boom"] - 1]
+        else:
+            out["transform_time"] = out["skull_time"] + out["skull_hold"]
     if out["overlay_only"]:
         # the video stays exactly as it is: no freeze, no added skull, no camera fx
         out.update(freeze_on_skull=False, add_skull=False, flash=False, shake=False, slow_zoom=0.0)
@@ -146,13 +162,42 @@ def load_config(path):
 
 
 def timeline(cfg, meta):
+    """Frame indices: skull hit, transformation, reference frame (the one the boxes are measured on), end."""
     fps = float(meta["fps"])
     skull_i = int(round(cfg["skull_time"] * fps))
-    trans_i = int(round((cfg["skull_time"] + cfg["skull_hold"]) * fps))
-    freeze_i = skull_i if cfg["freeze_on_skull"] else trans_i
+    trans_i = int(round(cfg["transform_time"] * fps))
+    if cfg["freeze_on_skull"]:
+        ref_i = skull_i
+    else:
+        ref_i = int(round(cfg["ref_time"] * fps)) if cfg["ref_time"] is not None else trans_i
     end_t = cfg["end_time"] if cfg["end_time"] is not None else meta["duration"]
     end_i = int(math.floor(end_t * fps + 1e-6))
-    return fps, skull_i, trans_i, freeze_i, end_i
+    return fps, skull_i, trans_i, ref_i, end_i
+
+
+# ---------------------------------------------------------------- audio
+
+def find_booms(path, after, sr=22050):
+    """Times (s) of the bass hits after `after`: where the bass comes back in after a dip."""
+    pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"],
+                         capture_output=True, check=True).stdout
+    x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
+    hop, win = 256, 1024
+    frames = np.lib.stride_tricks.sliding_window_view(x, win)[::hop] * np.hanning(win)
+    spec = np.abs(np.fft.rfft(frames, axis=1))
+    freqs = np.fft.rfftfreq(win, 1 / sr)
+    e = np.convolve(spec[:, (freqs > 30) & (freqs < 160)].sum(1), np.ones(3) / 3, mode="same")
+    t = (np.arange(len(e)) * hop + win / 2) / sr
+    rad = int(0.25 * sr / hop)
+    booms = []
+    for i in range(len(e)):
+        lo, hi = max(0, i - rad), min(len(e), i + rad)
+        if e[i] == e[lo:hi].min() and e[i] < 0.6 * e[lo:hi].max():
+            peak = e[i:hi].max()
+            j = i + int(np.argmax(e[i:hi] >= e[i] + 0.5 * (peak - e[i])))
+            if not booms or t[j] - booms[-1] > 0.15:
+                booms.append(float(t[j]))
+    return [b for b in booms if b > after + 0.15]
 
 
 # ---------------------------------------------------------------- masks / inpainting
@@ -248,6 +293,32 @@ def best_clone_offset(frame, mask, down=3):
             if best_cost is None or cost < best_cost:
                 best, best_cost = (dx, dy), cost
     return best[0] * down, best[1] * down
+
+
+def avatar_sprite(p, cfg, frame):
+    """The PNG pasted over a player: their own `png`, or a rendered Roblox avatar in their kit."""
+    if p.get("png"):
+        path = p["png"] if os.path.isabs(p["png"]) else os.path.join(cfg["_base"], p["png"])
+        img = Image.open(path).convert("RGBA")
+        return img.crop(img.getbbox())
+    kit = dict(cfg["kits"].get(p.get("kit"), {}))
+    for k in ("shirt", "stripes", "pants", "socks"):
+        if p.get(k):
+            kit[k] = p[k]
+    if "shirt" not in kit or "pants" not in kit:
+        shirt, pants = sample_colors(frame, p["box"])
+        kit.setdefault("shirt", "#%02x%02x%02x" % shirt)
+        kit.setdefault("pants", "#%02x%02x%02x" % pants)
+    pose = p.get("pose", "idle")
+    if pose not in avatar3d.POSES:
+        sys.exit(f"unknown pose {pose!r}; pick one of {', '.join(sorted(avatar3d.POSES))}")
+    name = p.get("kit") or "_".join(kit[k].lstrip("#") for k in ("shirt", "stripes", "pants") if kit.get(k))
+    path = os.path.join(HERE, "assets", "avatars", f"{name}_{pose}.png")
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"  rendering avatar {os.path.relpath(path, HERE)} ...")
+        avatar3d.render_avatar_png(path, kit["shirt"], kit["pants"], kit.get("stripes"), kit.get("socks"), pose)
+    return Image.open(path).convert("RGBA")
 
 
 def sample_colors(frame, box):
@@ -390,24 +461,25 @@ class Scene:
         self._plate = None
 
         self.actors = []
+        poof = cfg["appear"] == "poof"
         order = sorted(range(len(cfg["players"])), key=lambda i: cfg["players"][i]["box"][0])
         for n, i in enumerate(order):
             p = cfg["players"][i]
             x, y, w, h = p["box"]
-            shirt, pants = sample_colors(frame, p["box"])
-            shirt, pants = p.get("shirt", shirt), p.get("pants", pants)
-            stretch = p.get("stretch", cfg["stretch"])
-            pose = p.get("pose", rb.POSE_CYCLE[i % len(rb.POSE_CYCLE)])
-            stud = h * cfg["height_scale"] * p.get("scale", 1.0) / (5.3 * stretch)
-            spr, anchor = rb.render_avatar(stud, shirt, pants, pose=pose, stripes=p.get("stripes"))
+            # the avatar PNG is stretched to the player's box, whatever shape that is
+            fw, fh = p.get("fit", cfg["fit"])
+            spr = avatar_sprite(p, cfg, frame)
+            spr = spr.resize((max(1, int(w * fw)), max(1, int(h * fh))), Image.LANCZOS)
+            if p.get("flip"):
+                spr = spr.transpose(Image.FLIP_LEFT_RIGHT)
             clone = None
             if p.get("fill") == "clone":
                 clone = best_clone_offset(frame, self.masks[i], self.down)
                 print(f"  player {i}: clone fill from offset {clone}")
             self.actors.append({
-                "kind": "player", "idx": i, "sprite": spr, "anchor": anchor, "stretch": stretch,
-                "foot": tuple(p.get("foot", (x + w / 2, y + h))), "delay": 0.035 * n,
-                "phase": random.Random(i).random() * 6.28, "stud": stud, "mask": self.masks[i], "clone": clone,
+                "kind": "player", "idx": i, "sprite": spr, "anchor": (spr.width / 2, spr.height),
+                "foot": tuple(p.get("foot", (x + w / 2, y + h))), "delay": 0.035 * n if poof else 0.0,
+                "mask": self.masks[i], "clone": clone,
             })
         if cfg["ball"]:
             (bx, by), r = cfg["ball"]["center"], cfg["ball"]["radius"]
@@ -416,7 +488,8 @@ class Scene:
             ball = np.zeros((self.H, self.W), np.uint8)
             cv2.circle(ball, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
             self.actors.append({
-                "kind": "chest", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r), "delay": 0.08,
+                "kind": "chest", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r),
+                "delay": 0.08 if poof else 0.0,
                 "glow": rb.glow_sprite(cw * 0.95), "cw": cw, "mask": ball,
                 "sparkles": [(random.Random(k).uniform(-0.8, 0.8), random.Random(k + 50).uniform(0.1, 1.4),
                               random.Random(k + 99).uniform(0, 6.28)) for k in range(7)],
@@ -463,12 +536,13 @@ class Scene:
         ov = Image.new("RGBA", size, (0, 0, 0, 0))
         shadows = Image.new("RGBA", size, (0, 0, 0, 0))
         shd = ImageDraw.Draw(shadows)
+        poof = self.cfg["appear"] == "poof"
         for a in self.actors:
             tau = t - a["delay"]
             if a["kind"] == "player" and tau >= 0:
-                wd = a["stud"] * 4.6 * min(1.0, tau / 0.12)
+                wd = a["sprite"].width * 0.95 * (min(1.0, tau / 0.12) if poof else 1.0)
                 x, y = a["foot"]
-                shd.ellipse([x - wd / 2, y - wd * 0.12, x + wd / 2, y + wd * 0.12], fill=(0, 0, 0, 90))
+                shd.ellipse([x - wd / 2, y - wd * 0.14, x + wd / 2, y + wd * 0.14], fill=(0, 0, 0, 80))
         ov.alpha_composite(shadows)
 
         fx = Image.new("RGBA", size, (0, 0, 0, 0))
@@ -479,44 +553,36 @@ class Scene:
                 continue
             spr = a["sprite"]
             if a["kind"] == "player":
-                S = a["stretch"]
-                if tau < 0.12:  # pop in at normal Roblox proportions
-                    k = ease_out_back(tau / 0.12)
-                    sx, sy = k, k
-                elif tau < 0.30:
-                    sx, sy = 1.0, 1.0
-                elif tau < 0.95:  # boing up to full stretch
-                    e = ease_out_elastic((tau - 0.30) / 0.65)
-                    sy = 1 + (S - 1) * e
-                    sx = 1 - 0.15 * (sy - 1) / max(S - 1, 1e-6)
-                else:  # idle wobble
-                    wob = math.sin(2 * math.pi * 1.6 * tau + a["phase"])
-                    sy, sx = S * (1 + 0.03 * wob), 0.85 * (1 - 0.02 * wob)
-                if sx > 0.02:
-                    self._put(ov, spr, a["anchor"], a["foot"], sx, sy)
-                self._poof(fxd, a["foot"][0], a["foot"][1] - a["stud"] * 2.6, a["stud"] * 3.2, tau, a["idx"])
+                if not poof:  # just pasted on, straight away
+                    _over(ov, spr, a["foot"][0] - a["anchor"][0], a["foot"][1] - a["anchor"][1])
+                    continue
+                k = ease_out_elastic(tau / 0.6)
+                if k > 0.02:
+                    self._put(ov, spr, a["anchor"], a["foot"], k, k)
+                self._poof(fxd, a["foot"][0], a["foot"][1] - spr.height * 0.5, spr.height * 0.45, tau, a["idx"])
             else:
                 cw = a["cw"]
                 fx_, fy_ = a["foot"]
-                glow_a = min(1.0, max(0.0, (tau - 0.1) / 0.4))
+                glow_a = min(1.0, max(0.0, (tau - 0.1) / 0.4)) if poof else 1.0
                 if glow_a > 0:
                     g = a["glow"].rotate(tau * 25, resample=Image.BILINEAR)
                     pulse = 0.85 + 0.15 * math.sin(tau * 5)
                     g.putalpha(g.getchannel("A").point(lambda v: int(v * glow_a * pulse)))
                     _over(ov, g, fx_ - g.width / 2, fy_ - cw * 0.45 - g.height / 2)
-                k = ease_out_elastic(tau / 0.7) if tau < 0.7 else 1 + 0.02 * math.sin(tau * 4)
+                k = ease_out_elastic(tau / 0.7) if poof and tau < 0.7 else 1 + 0.02 * math.sin(tau * 4)
                 if k > 0.02:
                     # squash & stretch: wide while it grows, narrow while it overshoots
                     sx = math.sqrt(k) if k < 1 else 1 - 0.6 * (k - 1)
                     self._put(ov, spr, a["anchor"], (fx_, fy_), sx, k)
-                if tau > 0.25:
+                if tau > 0.25 or not poof:
                     for ox, oy, ph in a["sparkles"]:
                         tw = 0.5 + 0.5 * math.sin(tau * 6 + ph)
                         if tw < 0.25:
                             continue
                         s = rb.sparkle(cw * 0.12 * tw)
                         _over(ov, s, fx_ + ox * cw - s.width / 2, fy_ - oy * cw * 0.75 - s.height / 2)
-                self._poof(fxd, fx_, fy_ - cw * 0.3, cw * 0.55, tau, 999)
+                if poof:
+                    self._poof(fxd, fx_, fy_ - cw * 0.3, cw * 0.55, tau, 999)
         ov.alpha_composite(fx)
         return ov, (hole, clones), pending
 
@@ -605,7 +671,7 @@ class Skull:
 
 def write_sfx(path, cfg, sr=44100):
     """Synthesised pop + boing + chime, positioned on the transform moment."""
-    t0 = cfg["skull_time"] + cfg["skull_hold"]
+    t0 = cfg["transform_time"]
     n = int(sr * (t0 + 2.5))
     out = np.zeros(n, np.float32)
 
@@ -638,7 +704,7 @@ class Composer:
 
     def __init__(self, cfg, meta):
         self.cfg = cfg
-        self.fps, self.skull_i, self.trans_i, self.freeze_i, self.end_i = timeline(cfg, meta)
+        self.fps, self.skull_i, self.trans_i, self.ref_i, self.end_i = timeline(cfg, meta)
         self.skull = Skull(cfg, meta["w"] & ~1, meta["h"] & ~1) if cfg["add_skull"] else None
         self.freeze = self.scene = self.tracker = None
 
@@ -672,7 +738,8 @@ def cmd_render(args):
     W, H = meta["w"] & ~1, meta["h"] & ~1
     os.makedirs(os.path.dirname(cfg["output"]) or ".", exist_ok=True)
     print(f"{W}x{H} @ {fps:.3f}fps  skull@{comp.skull_i}  transform@{comp.trans_i}  "
-          f"reference@{comp.freeze_i}  end@{end_i}  {'overlay-only' if cfg['overlay_only'] else 'freeze'}")
+          f"reference@{comp.ref_i}  end@{end_i}  {'overlay-only' if cfg['overlay_only'] else 'freeze'}")
+    comp.reference(frames_at(cfg["input"], meta, [comp.ref_i])[comp.ref_i])
 
     tmpdir = tempfile.mkdtemp()
     cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
@@ -702,8 +769,6 @@ def cmd_render(args):
     for i, frame in enumerate(iter_frames(cfg["input"], meta)):
         if i >= end_i:
             break
-        if i == comp.freeze_i:
-            comp.reference(frame)
         enc.stdin.write(np.ascontiguousarray(comp.frame(frame, i)).tobytes())
         if i % 30 == 0:
             print(f"  frame {i}/{end_i}", end="\r", flush=True)
@@ -724,8 +789,8 @@ def cmd_preview(args):
     meta = probe(cfg["input"], cfg["upscale"])
     comp = Composer(cfg, meta)
     i = comp.trans_i + int(round(args.t * comp.fps))
-    got = frames_at(cfg["input"], meta, [comp.freeze_i, i])
-    comp.reference(got[comp.freeze_i])
+    got = frames_at(cfg["input"], meta, [comp.ref_i, i])
+    comp.reference(got[comp.ref_i])
     out = comp.frame(got[i], i)
     path = args.out or os.path.splitext(cfg["output"])[0] + f"_preview_{args.t:.2f}s.png"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -752,8 +817,8 @@ def cmd_grab(args):
     if args.target.endswith(".json"):
         cfg = load_config(args.target)
         meta = probe(cfg["input"], cfg["upscale"])
-        fps, _, _, freeze_i, _ = timeline(cfg, meta)
-        src, idx = cfg["input"], freeze_i
+        fps, _, _, ref_i, _ = timeline(cfg, meta)
+        src, idx = cfg["input"], ref_i
         if args.time is not None:
             idx = int(round(args.time * fps))
     else:
