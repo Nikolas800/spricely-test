@@ -66,6 +66,8 @@ def sd_round_cyl(p, ra, rb, h):
 
 
 class Avatar:
+    unit = 1.0  # world units per stud; tolerances below scale with it
+
     def __init__(self, shirt, pants, stripes=None, skin=SKIN, socks=None, pose="idle"):
         self.col = {
             "skin": _lin(skin), "shirt": _lin(shirt), "pants": _lin(pants),
@@ -135,7 +137,8 @@ class Avatar:
             out[sel] = col
         return out
 
-    def normal(self, p, eps=2e-3):
+    def normal(self, p, eps=None):
+        eps = 2e-3 * self.unit if eps is None else eps
         k = np.array([[1, -1, -1], [-1, -1, 1], [-1, 1, -1], [1, 1, 1]], np.float32)
         n = sum(k[i] * self.sdf(p + k[i] * eps)[..., None] for i in range(4))
         return n / np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-8)
@@ -149,24 +152,25 @@ class Avatar:
                 break
             dist = self.sdf(o[active] + d[active] * t[active, None])
             t[active] += dist
-            done = dist < 1e-3
+            done = dist < 1e-3 * self.unit
             hit[active[done]] = True
             active = active[~done & (t[active] < tmax)]
         return t, hit
 
     def soft_shadow(self, p, L, k=10.0, steps=28):
         res = np.ones(len(p), np.float32)
-        t = np.full(len(p), 0.03, np.float32)
+        u = self.unit
+        t = np.full(len(p), 0.03 * u, np.float32)
         for _ in range(steps):
             h = self.sdf(p + L * t[:, None])
             res = np.minimum(res, np.clip(k * h / t, 0, 1))
-            t += np.clip(h, 0.02, 0.4)
+            t += np.clip(h, 0.02 * u, 0.4 * u)
         return np.clip(res, 0, 1)
 
     def ao(self, p, n):
-        occ, w = np.zeros(len(p), np.float32), 1.0
+        occ, w = np.zeros(len(p), np.float32), 1.0 / self.unit
         for i in range(1, 6):
-            h = 0.06 * i
+            h = 0.06 * i * self.unit
             occ += (h - self.sdf(p + n * h)) * w
             w *= 0.7
         return np.clip(1 - 2.2 * occ, 0, 1)
@@ -190,9 +194,13 @@ class Avatar:
         idx = np.where(hit)[0]
         p = o[idx] + d[idx] * t[idx, None]
         _, ids = self.sdf(p, with_id=True)
+        rgb[idx] = self.shade(p, ids, right, up, fwd)
+        return finish(rgb, hit, H, W, ss)
+
+    def shade(self, p, ids, right, up, fwd):
+        """Plastic look: key light with soft shadows, fill, rim, hemisphere ambient with AO."""
         n = self.normal(p)
         alb = self.albedo(p, ids)
-
         key = -0.55 * right + 0.95 * up - 0.75 * fwd
         key /= np.linalg.norm(key)
         fill = 0.9 * right + 0.15 * up - 0.5 * fwd
@@ -213,23 +221,27 @@ class Avatar:
         sky = 0.5 + 0.5 * n[:, 1]  # hemisphere ambient
         lit = alb * (0.34 * occ * (0.6 + 0.4 * sky) + 0.82 * dk + 0.26 * df)[:, None]
         lit += (0.18 * spec + 0.3 * rimv)[:, None] * np.array([1.0, 0.98, 0.95], np.float32)
-        rgb[idx] = lit
+        return lit
 
-        img = np.zeros((len(o), 4), np.float32)
-        img[:, :3] = np.clip(rgb, 0, 1) ** (1 / 2.2)
-        img[:, 3] = hit
-        img = img.reshape(H, W, 4)
-        # downsample with premultiplied alpha for clean edges
-        img[..., :3] *= img[..., 3:]
-        img = img.reshape(H // ss, ss, W // ss, ss, 4).mean((1, 3))
-        a = img[..., 3:]
-        img[..., :3] = np.where(a > 0, img[..., :3] / np.maximum(a, 1e-6), 0)
-        out = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8), "RGBA")
-        return out.crop(out.getbbox())
+
+def finish(rgb, hit, H, W, ss):
+    """Linear colours + hit mask (H*W rays) -> supersampled-down, cropped RGBA image and its crop offset."""
+    img = np.zeros((len(rgb), 4), np.float32)
+    img[:, :3] = np.clip(rgb, 0, 1) ** (1 / 2.2)
+    img[:, 3] = hit
+    img = img.reshape(H, W, 4)
+    # downsample with premultiplied alpha for clean edges
+    img[..., :3] *= img[..., 3:]
+    img = img.reshape(H // ss, ss, W // ss, ss, 4).mean((1, 3))
+    a = img[..., 3:]
+    img[..., :3] = np.where(a > 0, img[..., :3] / np.maximum(a, 1e-6), 0)
+    out = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8), "RGBA")
+    bbox = out.getbbox()
+    return out.crop(bbox), (bbox[0], bbox[1])
 
 
 def render_avatar_png(path, shirt, pants, stripes=None, socks=None, pose="idle", height_px=520):
-    img = Avatar(shirt, pants, stripes=stripes, socks=socks, pose=pose).render(height_px=height_px)
+    img, _ = Avatar(shirt, pants, stripes=stripes, socks=socks, pose=pose).render(height_px=height_px)
     img.save(path)
     return img
 

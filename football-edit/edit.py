@@ -34,6 +34,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import avatar3d
+import rig
 import roblox as rb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,7 @@ DEFAULTS = {
     "transform_time": None,
     "ref_time": None,
     "appear": "instant",
+    "remove_players": True,
     "freeze_on_skull": True,
     "add_skull": False,
     "skull": {"x": 0.5, "y": 0.42, "size": 0.42, "after": "pop"},
@@ -221,6 +223,33 @@ def player_mask(frame, box, pad=0.12):
     full[y0:y1, x0:x1] = m
     # if the background isn't pitch the whole box goes; fine, the avatar covers it
     return full
+
+
+def silhouette(frame, box, pad=0.3):
+    """The player's own outline: non-grass pixels around `box` (bool), lightly closed."""
+    H, W = frame.shape[:2]
+    x, y, w, h = box
+    x0, y0 = max(0, int(x - w * pad)), max(0, int(y - h * pad))
+    x1, y1 = min(W, int(x + w * (1 + pad))), min(H, int(y + h * (1 + pad)))
+    m = np.zeros((H, W), np.uint8)
+    m[y0:y1, x0:x1] = (~grass(frame[y0:y1, x0:x1])).astype(np.uint8)
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+
+
+def clip_sprite(spr, off, sil, grow=4):
+    """Trim a sprite placed at `off` to the (slightly grown, soft-edged) silhouette."""
+    k = 2 * grow + 1
+    soft = cv2.GaussianBlur(cv2.dilate(sil.astype(np.uint8) * 255, np.ones((k, k), np.uint8)).astype(np.float32),
+                            (0, 0), 1.5) / 255
+    x, y = int(off[0]), int(off[1])
+    H, W = sil.shape
+    m = np.zeros((spr.height, spr.width), np.float32)
+    sx0, sy0, sx1, sy1 = max(0, -x), max(0, -y), min(spr.width, W - x), min(spr.height, H - y)
+    if sx1 > sx0 and sy1 > sy0:
+        m[sy0:sy1, sx0:sx1] = soft[y + sy0:y + sy1, x + sx0:x + sx1]
+    arr = np.asarray(spr).copy()
+    arr[..., 3] = (arr[..., 3] * m).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
 
 
 def solid_mask(frame, box):
@@ -466,19 +495,31 @@ class Scene:
         for n, i in enumerate(order):
             p = cfg["players"][i]
             x, y, w, h = p["box"]
-            # the avatar PNG is stretched to the player's box, whatever shape that is
-            fw, fh = p.get("fit", cfg["fit"])
-            spr = avatar_sprite(p, cfg, frame)
-            spr = spr.resize((max(1, int(w * fw)), max(1, int(h * fh))), Image.LANCZOS)
-            if p.get("flip"):
-                spr = spr.transpose(Image.FLIP_LEFT_RIGHT)
+            if p.get("rig"):
+                # a character built on the player's own joints, trimmed to their outline
+                sil = silhouette(frame, p["box"])
+                outfit = p.get("outfit", "swat")
+                outfit = outfit if outfit == "swat" else cfg["kits"][outfit]
+                print(f"  fitting player {i} ({p.get('outfit', 'swat')}) ...")
+                spr, (ox, oy) = rig.render_fitted(p["rig"], outfit, sil, os.path.join(HERE, ".cache", "rigs"))
+                if p.get("clip", True):
+                    spr = clip_sprite(spr, (ox, oy), sil)
+                foot = (ox + spr.width / 2, oy + spr.height)
+            else:
+                # the avatar PNG is stretched to the player's box, whatever shape that is
+                fw, fh = p.get("fit", cfg["fit"])
+                spr = avatar_sprite(p, cfg, frame)
+                spr = spr.resize((max(1, int(w * fw)), max(1, int(h * fh))), Image.LANCZOS)
+                if p.get("flip"):
+                    spr = spr.transpose(Image.FLIP_LEFT_RIGHT)
+                foot = tuple(p.get("foot", (x + w / 2, y + h)))
             clone = None
             if p.get("fill") == "clone":
                 clone = best_clone_offset(frame, self.masks[i], self.down)
                 print(f"  player {i}: clone fill from offset {clone}")
             self.actors.append({
                 "kind": "player", "idx": i, "sprite": spr, "anchor": (spr.width / 2, spr.height),
-                "foot": tuple(p.get("foot", (x + w / 2, y + h))), "delay": 0.035 * n if poof else 0.0,
+                "foot": foot, "delay": 0.035 * n if poof else 0.0,
                 "mask": self.masks[i], "clone": clone,
             })
         if cfg["ball"]:
@@ -526,6 +567,8 @@ class Scene:
         hole, clones = self.erase.copy(), []
         pending = np.zeros((self.H, self.W), np.uint8)
         for a in self.actors:
+            if not self.cfg["remove_players"]:
+                continue
             if t < a["delay"]:
                 pending |= a["mask"]
             elif a.get("clone"):
@@ -539,7 +582,7 @@ class Scene:
         poof = self.cfg["appear"] == "poof"
         for a in self.actors:
             tau = t - a["delay"]
-            if a["kind"] == "player" and tau >= 0:
+            if a["kind"] == "player" and tau >= 0 and self.cfg["remove_players"]:
                 wd = a["sprite"].width * 0.95 * (min(1.0, tau / 0.12) if poof else 1.0)
                 x, y = a["foot"]
                 shd.ellipse([x - wd / 2, y - wd * 0.14, x + wd / 2, y + wd * 0.14], fill=(0, 0, 0, 80))

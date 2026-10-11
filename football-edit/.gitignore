@@ -2,3 +2,4 @@ __pycache__/
 *_preview_*.png
 frame_*.png
 contact.png
+.cache/
