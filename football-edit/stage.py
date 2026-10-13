@@ -82,3 +82,75 @@ def hero_sprite(hero, kits, height):
     img = Image.open(path).convert("RGBA")
     w = max(1, int(img.width * height / img.height))
     return img.resize((w, int(height)), Image.LANCZOS)
+
+
+class Look:
+    """Makes the swapped-in scene sit in the edit: graded and softened like the clip's own footage.
+
+    Brightness/contrast are matched to the clip's reference frame (then scaled by
+    `brightness` / `contrast`), saturation is cut, the colour cast is pulled towards the
+    clip's, and the picture goes through the clip's own resolution so it's as soft.
+    """
+
+    def __init__(self, ref, scene, rows, opts, down):
+        self.top, self.bot = rows
+        self.down = max(1, int(down))
+        o = {"brightness": 0.9, "contrast": 0.95, "saturation": 0.62, "tint": 0.5, "soften": 0.0, "grain": 0.0}
+        o.update(opts or {})
+        self.o = o
+        ref_lab = self._lab(ref)
+        sc_lab = self._lab(scene)
+        rm, rs = ref_lab.mean(0), ref_lab.std(0)
+        sm, ss = sc_lab.mean(0), sc_lab.std(0)
+        self.src_mean = sm
+        self.kL = float(rs[0] / max(ss[0], 1e-3)) * o["contrast"]
+        self.L_target = float(rm[0]) * o["brightness"]
+        self.kC = o["saturation"]
+        self.ab_target = sm[1:] + o["tint"] * (rm[1:] - sm[1:])
+
+    def _lab(self, img):
+        c = img[self.top:self.bot]
+        return cv2.cvtColor(c, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+
+    def apply(self, img, seed=0):
+        out = img.copy()
+        c = img[self.top:self.bot]
+        lab = cv2.cvtColor(c, cv2.COLOR_RGB2LAB).astype(np.float32)
+        L = (lab[..., 0] - self.src_mean[0]) * self.kL + self.L_target
+        L = np.where(L > 205, 205 + (L - 205) * 0.4, L)  # roll off the hot highlights
+        lab[..., 0] = L
+        lab[..., 1:] = (lab[..., 1:] - self.src_mean[1:]) * self.kC + self.ab_target
+        c = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+        h, w = c.shape[:2]
+        if self.down > 1:  # same resolution as the clip -> same softness
+            small = cv2.resize(c, (w // self.down, h // self.down), interpolation=cv2.INTER_AREA)
+            if self.o["soften"] > 0:
+                small = cv2.GaussianBlur(small, (0, 0), self.o["soften"])
+            if self.o["grain"] > 0:
+                rng = np.random.default_rng(seed)
+                small = np.clip(small + rng.normal(0, self.o["grain"], small.shape[:2])[..., None], 0, 255)
+                small = small.astype(np.uint8)
+            c = cv2.resize(small, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        out[self.top:self.bot] = c
+        return out
+
+
+def punch(img, t, rows, zoom=0.08, split=10.0, length=0.25):
+    """Impact on the cut: a quick zoom-in that settles, with an RGB split that fades."""
+    if t >= length or (zoom <= 0 and split <= 0):
+        return img
+    k = (1 - t / length) ** 2
+    top, bot = rows
+    c = img[top:bot]
+    h, w = c.shape[:2]
+    z = 1 + zoom * k
+    M = np.float32([[z, 0, (1 - z) * w / 2], [0, z, (1 - z) * h / 2]])
+    c = cv2.warpAffine(c, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    d = split * k
+    if d >= 0.5:
+        r = cv2.warpAffine(c[..., 0], np.float32([[1, 0, d], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REFLECT)
+        b = cv2.warpAffine(c[..., 2], np.float32([[1, 0, -d], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REFLECT)
+        c = np.dstack([r, c[..., 1], b])
+    out = img.copy()
+    out[top:bot] = c
+    return out

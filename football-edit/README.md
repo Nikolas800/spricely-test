@@ -57,6 +57,13 @@ overlaying the live footage:
   down).
 - Every frame of the new scene still gets the clip's tracked shake and brightness, so the cut feels like part of
   the same edit.
+- `look` grades the new scene to match the clip (the defaults are shown):
+  `{"brightness": 0.9, "contrast": 0.95, "saturation": 0.62, "tint": 0.5, "soften": 0.0, "grain": 0.0}`.
+  Brightness and contrast are relative to the clip's reference frame, `saturation` scales the colour, `tint`
+  pulls the colour cast towards the clip's, and the scene always goes through the clip's own resolution so it is
+  exactly as soft. `soften` adds extra blur and `grain` adds noise on top.
+- `punch` is the hit on the cut: `{"zoom": 0.08, "split": 10, "length": 0.25}`, a quick zoom-in that settles
+  plus an RGB split that fades (set both to 0 for a dry cut).
 
 ## The Roblox characters
 

@@ -534,9 +534,10 @@ class Scene:
             ball = nothing.copy()
             cv2.circle(ball, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
             self.actors.append(self._vault((bx, by + r), cw, ball, 0.08 if poof else 0.0))
-        self.swap = None
+        self.swap = self.look = None
         if cfg["swap"]:  # the whole picture becomes this Roblox scene
             self.swap = stage.canvas(frame, cfg["swap"], cfg["_base"])
+            self.rows = cfg["swap"].get("rows") or stage.content_rows(frame)
         if cfg["hero"]:  # the Roblox player in front, carrying the vault on their head
             h = cfg["hero"]
             spr = stage.hero_sprite(h, cfg["kits"], h["height"])
@@ -550,6 +551,9 @@ class Scene:
                 self.actors.append(v)
         # far to near; the hero and what they carry always go on top
         self.actors.sort(key=lambda a: (a.get("front", 0), a["foot"][1]))
+        if self.swap is not None:  # grade the new scene (with everyone in it) to match the clip
+            scene = composite(self.swap, premultiply(self.layer(1.0)[0]))
+            self.look = stage.Look(frame, scene, self.rows, cfg["swap"].get("look"), cfg["upscale"])
 
     def _vault(self, foot, width, mask, delay):
         spr, anchor = vault.sprite(width)
@@ -688,6 +692,9 @@ class Scene:
             # straight clip swap: the Roblox scene + characters replace the whole picture, but keep the
             # edit's own shake, flicker and fade-out
             scene = composite(self.swap, premultiply(ov))
+            scene = self.look.apply(scene, seed=int(t * 1000))
+            fx = self.cfg["swap"].get("punch", {})
+            scene = stage.punch(scene, t, self.rows, fx.get("zoom", 0.08), fx.get("split", 10.0), fx.get("length", 0.25))
             scene = cv2.warpAffine(scene, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             return np.clip(scene.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
         base = self.clean(live, holes, M)
