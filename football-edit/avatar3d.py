@@ -69,12 +69,13 @@ def sd_round_cyl(p, ra, rb, h):
 class Avatar:
     unit = 1.0  # world units per stud; tolerances below scale with it
 
-    def __init__(self, shirt, pants, stripes=None, skin=SKIN, socks=None, pose="idle"):
+    def __init__(self, shirt, pants, stripes=None, skin=SKIN, socks=None, pose="idle", hair=None, beard=None):
         self.col = {
             "skin": _lin(skin), "shirt": _lin(shirt), "pants": _lin(pants),
             "stripes": _lin(stripes) if stripes else None,
             "socks": _lin(socks) if socks else _lin(pants) * 0.85,
             "shoe": _lin("#1c1c1c"), "ink": _lin("#141414"),
+            "hair": _lin(hair) if hair else None, "beard": _lin(beard) if beard else None,
         }
         rots = POSES[pose]
 
@@ -91,6 +92,8 @@ class Avatar:
             ("rarm", "box", (1.53, 3.5, 0), R("rarm"), (0, -0.5, 0), (0.5, 1.0, 0.5)),
             ("head", "head", (0, 4.03, 0), np.eye(3, dtype=np.float32), (0, 0.6, 0), None),
         ]
+        if hair:
+            self.parts.append(("hair", "hair", (0, 4.03, 0), np.eye(3, dtype=np.float32), (0, 0.6, 0), None))
 
     def local(self, p, part):
         _, _, pivot, Rm, off, _ = part
@@ -102,6 +105,9 @@ class Avatar:
             q = self.local(p, part)
             if part[1] == "box":
                 ds.append(sd_round_box(q, part[5], 0.13))
+            elif part[1] == "hair":  # a cap of hair over the top of the head, down to the brow
+                qq = q - np.float32([0, 0.16, 0])
+                ds.append(np.maximum(sd_round_cyl(qq, 0.67, 0.3, 0.56), -(q[..., 1] - 0.3)))
             else:
                 ds.append(sd_round_cyl(q, 0.62, 0.24, 0.6))
         ds = np.stack(ds, -1)
@@ -127,9 +133,14 @@ class Avatar:
             elif name in ("lleg", "rleg"):
                 col = np.where((q[:, 1] > 0.05)[:, None], c["pants"], c["socks"])
                 col = np.where((q[:, 1] < -0.82)[:, None], c["shoe"], col)
+            elif name == "hair":
+                col = np.broadcast_to(c["hair"], q.shape).copy()
             else:  # head + face decal on the front
                 col = np.broadcast_to(c["skin"], q.shape).copy()
                 u, v, front = q[:, 0], q[:, 1], q[:, 2] > 0.3
+                if c.get("beard") is not None:  # jaw line + sideburns, below the smile
+                    beard = (q[:, 2] > -0.15) & ((v < -0.3) | ((np.abs(u) > 0.44) & (v < 0.0)))
+                    col[beard] = c["beard"]
                 eyes = (((np.abs(u) - 0.2) / 0.08) ** 2 + ((v - 0.04) / 0.16) ** 2) < 1
                 rr = np.hypot(u, v - 0.06)
                 ang = np.degrees(np.arctan2(u, -(v - 0.06)))

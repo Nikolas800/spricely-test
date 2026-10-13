@@ -6,9 +6,11 @@ as wide as their limbs, and trimmed to their outline. The real players stay unde
 holographic "secret prototype vault"** with a colour-cycling neon glow.
 
 `config.json` is the finished setup for `input/videoplayback123.mp4` (the Messi edit). Its output is
-`output/messi_roblox_edit.mp4`. The skull lands at 14.73s, and the booms after it are at 15.33, 15.71 and 16.17s.
-On boom 2 (15.71s), every player turns into a SWAT Roblox character, except Messi, who stays in his Barça kit
-next to the vault.
+`output/messi_roblox_edit.mp4`. The skull lands at 14.73s, and the booms after it are at 15.24, 15.70 and 16.16s.
+On boom 1 (15.24s), the shot hard-cuts to the Roblox game (`assets/depot.webp`, the "Level 4: Armored Truck Depot"
+screenshot, with the screenshotter's character and a passer-by painted out). The SWAT Roblox guards stand exactly
+where the players were, and a Roblox Messi stands in front of them carrying the vault on his head. The clip's own
+shake, flicker and fade-out carry on over the new scene.
 
 There are two modes:
 
@@ -36,6 +38,25 @@ python edit.py render config.json                        # -> output/football_ro
 3. Use `grab` to get the reference frame, with a pixel grid on it. Draw a box around each player
    (`[x, y, width, height]`, top-left corner plus size) and note the ball's centre and radius.
 4. Use `preview` to check the result, then `render`.
+
+## Clip swap (`swap` + `hero`)
+
+`swap` replaces the whole picture at the transform moment with a still image (a game screenshot) instead of
+overlaying the live footage:
+
+```json
+"swap": {"image": "assets/depot.webp", "crop": [x0, y0, x1, y1], "erase": [[x, y, w, h], ...]},
+"hero": {"foot": [x, y], "height": 320, "kit": "barca", "skin": "#e2b38c", "hair": "#4a2f1d",
+         "beard": "#4a2f1d", "prop": "vault"}
+```
+
+- `crop` is in screenshot pixels and should have the shape of the clip's picture area. `erase` boxes are painted
+  out first. The result is sharpened, graded and placed between the clip's black bars.
+- The fitted characters (`players`) are drawn at their usual spots. The `hero` (a Roblox player rendered by
+  `stage.py`) is drawn in front of everyone, with the vault floating on their head (`head_sink` moves it up or
+  down).
+- Every frame of the new scene still gets the clip's tracked shake and brightness, so the cut feels like part of
+  the same edit.
 
 ## The Roblox characters
 
@@ -90,6 +111,7 @@ python avatar3d.py out.png --shirt "#1b3f94" --stripes "#a50044" --pants "#1b3f9
 | `skull_hold` | `1.0` | used when neither of the above is set: transform this long after the skull |
 | `ref_time` | transform time | the frame your boxes are measured on (`grab` shows it) |
 | `appear` | `"instant"` | `"instant"` = pasted on in one frame; `"poof"` = smoke puff + elastic pop, one player at a time |
+| `swap` / `hero` | `null` | cut to a still Roblox scene with a hero character in front (see "Clip swap") |
 | `remove_players` | `true` | `false` = overlay only: the real players and ball stay underneath the characters and vault |
 | `keep_on_top` | `[]` | `[x,y,w,h]` boxes around things in the clip (like its 💀) that should stay in front of the stickers |
 | `kits` | `{}` | named colour sets: `{"barca": {"shirt": "#...", "stripes": "#...", "pants": "#...", "socks": "#..."}}` |
@@ -119,6 +141,7 @@ All coordinates are pixels in the (upscaled) frame that `grab` gives you.
   image onto each player with linear blend skinning over a triangle mesh.
 - `avatar3d.py` is a small numpy SDF raymarcher: rounded R6 parts, soft shadows, ambient occlusion, rim light, the
   classic smile and striped kits.
+- `stage.py` builds the swap scene from a screenshot and renders the hero player.
 - `vault.py` models the vault (rainbow-framed holographic cube, magenta screen, rainbow keypad, dial, LEDs, magenta
   handle, glowing green pad), renders it once to `assets/vault.png`, and animates its neon glow, sheen and
   sparkles. `python vault.py` re-renders it.

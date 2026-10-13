@@ -35,6 +35,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import avatar3d
 import puppet
+import stage
 import vault
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,8 @@ DEFAULTS = {
     "fit": [1.1, 1.08],
     "players": [],
     "ball": None,
+    "swap": None,
+    "hero": None,
     "end_time": None,
     "flash": True,
     "shake": True,
@@ -184,7 +187,7 @@ def find_booms(path, after, sr=22050):
     pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"],
                          capture_output=True, check=True).stdout
     x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
-    hop, win = 256, 1024
+    hop, win = 128, 1024
     frames = np.lib.stride_tricks.sliding_window_view(x, win)[::hop] * np.hanning(win)
     spec = np.abs(np.fft.rfft(frames, axis=1))
     freqs = np.fft.rfftfreq(win, 1 / sr)
@@ -195,8 +198,9 @@ def find_booms(path, after, sr=22050):
     for i in range(len(e)):
         lo, hi = max(0, i - rad), min(len(e), i + rad)
         if e[i] == e[lo:hi].min() and e[i] < 0.6 * e[lo:hi].max():
+            # the hit: where the bass has climbed a third of the way back up after the dip
             peak = e[i:hi].max()
-            j = i + int(np.argmax(e[i:hi] >= e[i] + 0.5 * (peak - e[i])))
+            j = i + int(np.argmax(e[i:hi] >= e[i] + 0.3 * (peak - e[i])))
             if not booms or t[j] - booms[-1] > 0.15:
                 booms.append(float(t[j]))
     return [b for b in booms if b > after + 0.15]
@@ -523,20 +527,38 @@ class Scene:
                 "foot": foot, "delay": 0.035 * n if poof else 0.0,
                 "mask": self.masks[i], "clone": clone,
             })
+        nothing = np.zeros((self.H, self.W), np.uint8)
         if cfg["ball"]:
             (bx, by), r = cfg["ball"]["center"], cfg["ball"]["radius"]
             cw = cfg["ball"].get("width", max(r * 7.5, min(self.W, self.H) * 0.15))
-            spr, anchor = vault.sprite(cw)
-            ball = np.zeros((self.H, self.W), np.uint8)
+            ball = nothing.copy()
             cv2.circle(ball, (int(bx), int(by)), int(r * 1.7 + 3), 255, -1)
-            self.actors.append({
-                "kind": "vault", "idx": -1, "sprite": spr, "anchor": anchor, "foot": (bx, by + r),
-                "delay": 0.08 if poof else 0.0,
-                "glow": vault.Glow(spr), "cw": cw, "mask": ball,
-                "sparkles": [(random.Random(k).uniform(-0.8, 0.8), random.Random(k + 50).uniform(0.1, 1.4),
-                              random.Random(k + 99).uniform(0, 6.28)) for k in range(7)],
-            })
-        self.actors.sort(key=lambda a: a["foot"][1])
+            self.actors.append(self._vault((bx, by + r), cw, ball, 0.08 if poof else 0.0))
+        self.swap = None
+        if cfg["swap"]:  # the whole picture becomes this Roblox scene
+            self.swap = stage.canvas(frame, cfg["swap"], cfg["_base"])
+        if cfg["hero"]:  # the Roblox player in front, carrying the vault on their head
+            h = cfg["hero"]
+            spr = stage.hero_sprite(h, cfg["kits"], h["height"])
+            fx_, fy_ = h["foot"]
+            self.actors.append({"kind": "player", "idx": -2, "sprite": spr, "anchor": (spr.width / 2, spr.height),
+                                "foot": (fx_, fy_), "delay": 0.0, "mask": nothing, "clone": None, "front": 1})
+            if h.get("prop", "vault") == "vault":
+                top = fy_ - spr.height * (1 - h.get("head_sink", 0.03))
+                v = self._vault((fx_, top), h.get("prop_width", spr.width * 0.8), nothing, 0.0)
+                v["front"] = 2
+                self.actors.append(v)
+        # far to near; the hero and what they carry always go on top
+        self.actors.sort(key=lambda a: (a.get("front", 0), a["foot"][1]))
+
+    def _vault(self, foot, width, mask, delay):
+        spr, anchor = vault.sprite(width)
+        return {
+            "kind": "vault", "idx": -1, "sprite": spr, "anchor": anchor, "foot": foot, "delay": delay,
+            "glow": vault.Glow(spr), "cw": width, "mask": mask,
+            "sparkles": [(random.Random(k).uniform(-0.8, 0.8), random.Random(k + 50).uniform(0.1, 1.4),
+                          random.Random(k + 99).uniform(0, 6.28)) for k in range(7)],
+        }
 
     # -- pieces
 
@@ -662,6 +684,12 @@ class Scene:
         """Overlay-only version: the live frame stays, overlay follows the shot via M."""
         ov, holes, _ = self.layer(t)
         H, W = live.shape[:2]
+        if self.swap is not None:
+            # straight clip swap: the Roblox scene + characters replace the whole picture, but keep the
+            # edit's own shake, flicker and fade-out
+            scene = composite(self.swap, premultiply(ov))
+            scene = cv2.warpAffine(scene, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            return np.clip(scene.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
         base = self.clean(live, holes, M)
         ovw = cv2.warpAffine(premultiply(ov), M, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
         out = composite(base, ovw, a, b)
